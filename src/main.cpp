@@ -101,7 +101,7 @@ size_t LoadTrackImage(const char *filename, unsigned int *buffer)
 	// This is a little more involved than just copying from one buffer to
 	// another. The DA100 will store a '0x00' byte every time the delay
 	// counter wraps around (from 127 to 0). Thus, we maintain a carry count
-	// (incremented by 128 for each zero byte) which is added onto the next
+	// (incremented by 127 for each zero byte) which is added onto the next
 	// non-zero byte. We also track instances where carrying the value would
 	// cause an integer overflow in the data storage buffer -- this causes
 	// the function to return -1.
@@ -111,13 +111,13 @@ size_t LoadTrackImage(const char *filename, unsigned int *buffer)
 		// check for counter overflow from DA
 		if ((buf[s] & 127) == 0) {
 			// counter overflow, increase the carry register
-			if ((((unsigned long)carry) + 128) > int_limits.max()) {
+			if ((((unsigned long)carry) + 127) > int_limits.max()) {
 				// detected data overflow
 				delete[] buf;
 				return -1;
 			} else {
 				// otherwise keep carrying
-				carry += 128;
+				carry += 127;
 			}
 		} else {
 			// no overflow, just a normal count. store the count and clear
@@ -125,6 +125,11 @@ size_t LoadTrackImage(const char *filename, unsigned int *buffer)
 			buffer[count++] = carry + (buf[s] & 127);
 			carry = 0;
 		}
+	}
+
+	// if carry more than zero, dump it into the buffer
+	if (carry > 0) {
+		buffer[count++] = carry;
 	}
 
 	// free the file buffer
@@ -152,6 +157,21 @@ unsigned char decodeMFM(vector<bool> bits, size_t startpos)
 	return buf;
 }
 
+void dump_array(unsigned char *d, size_t len)
+{
+	int i=0;
+
+	printf("unsigned char data_array[] = {\n");
+	while (len > 0) {
+		printf("0x%02X%s", *(d++), (len-->1)?", ":"");
+		if (i++ == 15) {
+			printf("\n");
+			i=0;
+		}
+	}
+	printf("%s};\n", i>0?"\n":"");
+}
+
 // main fnc
 int main(int argc, char **argv)
 {
@@ -169,7 +189,7 @@ int main(int argc, char **argv)
 	{
 		ssize_t x = LoadTrackImage(argv[1], buf);
 		if (x < 1) {
-			cout << "error reading input file \"" << argv[1] << "\"\n";
+			cout << "error reading input file \"" << argv[1] << "\", code " << x << "\n";
 			return -1;
 		}
 		buflen = x;
@@ -186,7 +206,8 @@ int main(int argc, char **argv)
 	printf("total timing val = %lu\n", buftm);
 	printf("time(secs) = %f\n", ((float)buftm) * 25e-9);
 	printf("time(ms) = %f\n", ((float)buftm) * 25e-9 * 1000);
-	printf("est rpm = %f\n", 60 * (1/(((float)buftm) * 25e-9)));
+	float nsecs_per_tick = 1.0/100.0e6;
+	printf("est rpm = %f\n", 60 * (1/(((float)buftm) * nsecs_per_tick)));
 	printf("\n");
 	printf("maxval = %lu\nminval = %lu\nspan   = %lu\n", maxval, minval, maxval - minval);
 	printf("\n");
@@ -466,16 +487,17 @@ int main(int argc, char **argv)
 	// Nanoseconds counters. Increment once per loop or "virtual" nanosecond.
 	unsigned long nsecs1 = 0, nsecs2=0;
 	// Number of nanoseconds per acq tick -- (1/freq)*1e9. This is valid for 40MHz.
-	const unsigned long NSECS_PER_ACQ = 50;
+	const unsigned long NSECS_PER_ACQ = (1e10 / 100e6);
 	// Number of nanoseconds per PLLCK tick -- (1/16e6)*1e9. 16MHz. 
 	// This should be the reciprocal of 32 times the data rate in kbps, multiplied
 	// by 1e9 to get the time in nanoseconds.
-	const unsigned long NSECS_PER_PLLCK = 125*2;
+	// That is, (1/(TRANSITIONS_PER_BITCELL * PJL_COUNTER_MAX * DATA_RATE))*1e9
+	const unsigned long NSECS_PER_PLLCK = (1e10 / 640e6);
 	// Number of clock increments per loop (timing granularity). Best-case value
 	// for this is gcd(NSECS_PER_ACQ, NSECS_PER_PLLCK).
-	const unsigned long TIMER_INCREMENT = 25;
+	const unsigned long TIMER_INCREMENT = 1;
 	// Maximum value of the PJL counter. Determines the granularity of phase changes.
-	const unsigned char PJL_COUNTER_MAX = 16;
+	const unsigned char PJL_COUNTER_MAX = 64;
 
 	// Iterator for data buffer
 	size_t i = 0;
@@ -582,40 +604,48 @@ int main(int argc, char **argv)
 			// first bit of the new data byte (encoded word).
 			printf("IDAM at %lu\n", i+1);
 			num_idam++;
-			dump = 6;
+			dump = 5;
 			chk_data_crc = false;
 
 			// decode the IDAM
 			unsigned char *idambuf = new unsigned char[6];
-			for (size_t x=0; x<6; x++) {
+			for (size_t x=0; x<5; x++) {
 				idambuf[x] = decodeMFM(mfmbits, i+(x*16)+1);
 			}
 
-			printf("\tIDAM = Track %2d, Side %d, Sector %2d; sector size ",
-					idambuf[0], idambuf[1], idambuf[2]);
-			switch (idambuf[3]) {
+			printf("\tIDAM = Cylinder_Low %2d, Head %d, Sector %2d; %s; sector size ",
+					idambuf[0], idambuf[1] & 0x07, idambuf[2],
+					(idambuf[1] & 0x80) ? "BAD BLOCK" : "ok  block");
+			switch ((idambuf[1] >> 5) & 0x03) {
 				case 0x00:
+					next_data_dump = 256;
+					break;
 				case 0x01:
+					next_data_dump = 512;
+					break;
 				case 0x02:
+					next_data_dump = 1024;
+					break;
 				case 0x03:
-					printf("%d", 1 << (7+idambuf[3]));
-					next_data_dump = 1<<(7+idambuf[3]);
+					next_data_dump = 128;
 					break;
 				default:
-					printf("unknown (0x%02X)", idambuf[3]);
+					printf("unknown (0x%02X)", (idambuf[1] >> 5) & 0x03);
 					next_data_dump = 0;
 					break;
 			}
+			if (next_data_dump != 0) printf("%ld", next_data_dump);
 
 			// check the CRC
 			CRC16 c = CRC16();
-			c.update((char *)"\xA1\xA1\xA1\xFE", 4);
-			unsigned int crc = c.update(idambuf, 4);
-			printf("; CRC=%04X %s\n", (idambuf[4] << 8) | idambuf[5],
-					((unsigned int)((idambuf[4] << 8) | idambuf[5])==crc) ? "(ok)" : "BAD");
+			c.update((char *)"\xA1\xFE", 2);
+			unsigned int crc = c.update(idambuf, 3);
+			unsigned int got_crc = (idambuf[3] << 8) | idambuf[4];
+			printf("; RCRC=%04X", c.update(&idambuf[3], 2));
+			printf("; CRC=%04X (calc'd %04X) %s\n", got_crc, crc, (got_crc==crc) ? "(ok)" : "BAD");
 
 			delete idambuf;
-		} else if (bits == 0x44895545) {
+		} else if ((bits & 0xffff0000) == 0x44890000){ //(bits == 0x44895545) {
 			// Data Address Mark
 			// i+1 because "i" is the last bit of the DAM marker; we want the
 			// first bit of the new data byte (encoded word).
@@ -633,16 +663,18 @@ int main(int argc, char **argv)
 			// the first bit of the new data byte (encoded word).
 			//
 			unsigned char *buffer = new unsigned char[dump+2];
-			for (size_t x=0; x<dump+2; x++) {
+			for (size_t x=0; x<dump+6; x++) {
 				buffer[x] = decodeMFM(mfmbits, i+(x*16)+1);
 			}
-			hex_dump(buffer, dump);
+			hex_dump(buffer, dump+6);
+			dump_array(buffer, dump+6);
 
 			if (chk_data_crc) {
 				CRC16 c = CRC16();
-				c.update((char *)"\xA1\xA1\xA1\xFB", 4);
+				c.update((char *)"\xA1\xF8", 2);
 				unsigned int crc = c.update(buffer, dump);
-				printf("\tData record CRC=%04X %s\n", (buffer[dump+0] << 8) | buffer[dump+1],
+				printf("\tData record CRC=%04X (calc'd %04X) %s\n", (buffer[dump+0] << 8) | buffer[dump+1],
+						crc,
 						((unsigned int)((buffer[dump+0] << 8) | buffer[dump+1])==crc) ? "(ok)" : "BAD");
 			}
 
